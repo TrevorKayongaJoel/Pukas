@@ -1,5 +1,6 @@
 #include "config.h"
 #include "portal_html.h"
+#include "calibration.h"
 
 // ---------- Object Instances ----------
 Adafruit_ADS1115      ads;
@@ -13,6 +14,12 @@ Preferences          preferences;
 OneWire              oneWire(DS18B20_PIN);
 DallasTemperature    ds18b20(&oneWire);
 bool                 ds18b20Ok = false;
+
+// ---------- BME280 (pressure) ----------
+// Not fitted yet. Probed on every rail power-up, so the sensor starts working
+// the moment it is plugged in - no reflash required.
+Adafruit_BME280      bme;
+bool                 bmeOk = false;
 
 // ---------- Global Variables ----------
 int sleepIntervalSec = 300;
@@ -72,7 +79,8 @@ static unsigned long lastSnapshotMillis = 0;
 float windSpeed_MPH = 0.0;
 float windSpeed_MS  = 0.0;
 float windGust_MS   = 0.0;
-float rain_mm       = 0.0;
+float rain_mm       = 0.0;   // mm accumulated in the current interval, zeroed each snapshot
+float lastIntervalSec = 0.0;   // what windSpeed_MS and rain_mm actually average over
 
 void IRAM_ATTR countWindPulse() {
   uint32_t now = micros();
@@ -180,6 +188,7 @@ void snapshotPulseCounters() {
   if (windGust_MS < windSpeed_MS) windGust_MS = windSpeed_MS;
 
   rain_mm = (float)rainTips * MM_PER_TIP;
+  lastIntervalSec = elapsed;
 
   uint32_t missed = ambiguousWakes;
   ambiguousWakes = 0;
@@ -254,8 +263,20 @@ void sleepUntilNextEventOrDeadline() {
     // The wake was level-triggered, so whichever line is still low is the one
     // that woke us. A closure shorter than the wake latency can slip through;
     // ambiguousWakes counts those so the loss is measurable rather than silent.
+    // Sample both lines first: the contact that woke us may reopen within
+    // milliseconds, and anything read later is already too late.
     bool windLow = (digitalRead(WIND_PIN) == LOW);
     bool rainLow = (digitalRead(RAIN_PIN) == LOW);
+
+    // Give the pins back to the edge ISRs BEFORE the release waits below.
+    // Those waits can run for REED_RELEASE_MS each, and with the ISRs still
+    // detached a tip on the other channel during that window would vanish.
+    // Re-arming here cannot double count: the line is already low, so there is
+    // no falling edge to fire on, and the shared debounce covers the rest.
+    gpio_wakeup_disable((gpio_num_t)WIND_PIN);
+    gpio_wakeup_disable((gpio_num_t)RAIN_PIN);
+    attachInterrupt(digitalPinToInterrupt(WIND_PIN), windISR, FALLING);
+    attachInterrupt(digitalPinToInterrupt(RAIN_PIN), rainISR, FALLING);
 
     if (windLow) {
       countWindPulse();
@@ -266,13 +287,13 @@ void sleepUntilNextEventOrDeadline() {
       if (!waitForReedRelease(RAIN_PIN)) reportStuckReed("Rain");
     }
     if (!windLow && !rainLow) ambiguousWakes++;
+  } else {
+    // Timer wake, or sleep was rejected - nothing to attribute, just restore.
+    gpio_wakeup_disable((gpio_num_t)WIND_PIN);
+    gpio_wakeup_disable((gpio_num_t)RAIN_PIN);
+    attachInterrupt(digitalPinToInterrupt(WIND_PIN), windISR, FALLING);
+    attachInterrupt(digitalPinToInterrupt(RAIN_PIN), rainISR, FALLING);
   }
-
-  gpio_wakeup_disable((gpio_num_t)WIND_PIN);
-  gpio_wakeup_disable((gpio_num_t)RAIN_PIN);
-
-  attachInterrupt(digitalPinToInterrupt(WIND_PIN), windISR, FALLING);
-  attachInterrupt(digitalPinToInterrupt(RAIN_PIN), rainISR, FALLING);
 }
 
 // ---------- Config Load / Save ----------
@@ -459,6 +480,18 @@ void unmountSD() {
   sdMounted = false;
 }
 
+// Try both addresses the breakout boards use. Forced mode means the chip takes
+// one measurement on demand and returns to sleep, rather than free-running.
+static bool detectBME280() {
+  if (!bme.begin(BME280_ADDR_A) && !bme.begin(BME280_ADDR_B)) return false;
+  bme.setSampling(Adafruit_BME280::MODE_FORCED,
+                  Adafruit_BME280::SAMPLING_X1,    // temperature (compensation only)
+                  Adafruit_BME280::SAMPLING_X1,    // pressure
+                  Adafruit_BME280::SAMPLING_NONE,  // humidity - DHT22 owns this
+                  Adafruit_BME280::FILTER_OFF);
+  return true;
+}
+
 void sensorRailUp() {
   setSensorPower(true);
   delay(SENSOR_RAIL_SETTLE_MS);
@@ -489,6 +522,10 @@ void sensorRailUp() {
 
   ds18b20.begin();
   ds18b20Ok = (ds18b20.getDeviceCount() > 0);
+
+  bool bmeWasOk = bmeOk;
+  bmeOk = detectBME280();
+  if (bmeOk && !bmeWasOk) Serial.println("✅ BME280 detected - pressure now being recorded.");
 }
 
 void sensorRailDown() {
@@ -546,7 +583,7 @@ static void handleStatus() {
     doc["humidity"] = lastRecord.humidity;
     doc["windMS"]   = lastRecord.windMS;
     doc["gustMS"]   = lastRecord.windGustMS;
-    doc["rain"]     = lastRecord.rainTotal_mm;
+    doc["rain"]     = lastRecord.rainInterval_mm;
     doc["battV"]    = lastRecord.batteryVoltage;
     doc["battI"]    = lastRecord.batteryCurrent_mA;
     doc["solarV"]   = lastRecord.solarVoltage;
@@ -766,13 +803,16 @@ void printSensorValues(const DataRecord &rec) {
   Serial.println("│               📊 SENSOR READINGS                    │");
   
   Serial.printf("│ 📅 Timestamp:   %-30s │\n", rec.timestamp.c_str());
+  Serial.printf("│ ⏱️  Interval:    %6lu s                            │\n", (unsigned long)rec.intervalSec);
 
   Serial.printf("│ 🌬️  Wind avg:    %6.2f m/s  (%6.2f MPH)      │\n", rec.windMS, rec.windMPH);
   Serial.printf("│ 💨  Wind gust:   %6.2f m/s                       │\n", rec.windGustMS);
-  Serial.printf("│ 🌧️  Rain:        %8.2f mm this interval          │\n", rec.rainTotal_mm);
+  Serial.printf("│ 🌧️  Rain:        %8.2f mm this interval          │\n", rec.rainInterval_mm);
   
   Serial.printf("│ 🌡️  Air Temp:     %6.2f °C                        │\n", rec.temperature);
   Serial.printf("│ 💧  Humidity:     %6.1f %% RH                      │\n", rec.humidity);
+  Serial.printf("│ 🧭  Pressure:     %6.2f hPa  %-14s │\n", rec.pressure,
+                bmeOk ? "" : "(no BME280)");
   Serial.printf("│ 🔥  Batt Temp:    %6.2f °C                        │\n", rec.batteryTemp);
   
   Serial.printf("│ ☀️  Solar:        %6.3f V  %7.2f mA              │\n", rec.solarVoltage, rec.solarCurrent_mA);
@@ -780,6 +820,12 @@ void printSensorValues(const DataRecord &rec) {
   
   Serial.printf("│ 📊 ADC0: %6.4f V   ADC1: %6.4f V           │\n", rec.adc0, rec.adc1);
   Serial.printf("│ 📊 ADC2: %6.4f V   ADC3: %6.4f V           │\n", rec.adc2, rec.adc3);
+
+  int dirDeg = vaneDirectionInt(rec.adc0);
+  if (dirDeg >= 0) Serial.printf("│ 🧭  Wind dir:    %6d deg                         │\n", dirDeg);
+  else             Serial.println("│ 🧭  Wind dir:        -- (out of range)              │");
+  Serial.printf("│ 🌱  Soil:        %6.1f %%                            │\n", soilMoisturePct(rec.adc1));
+  Serial.printf("│ ☀️   Irradiance: %6.1f W/m2                        │\n", irradianceWm2(rec.adc2));
   Serial.println("\n");
 }
 
@@ -871,6 +917,9 @@ void setup() {
   lastSnapshotMillis = millis();
   Serial.println("🌬️ Wind & 🌧️ Rain interrupts armed.");
 
+  // ---- BME280 (pressure) ----
+  bmeOk = detectBME280();
+
   // ---- DS18B20 ----
   ds18b20.begin();
   if (ds18b20.getDeviceCount() > 0) {
@@ -916,6 +965,8 @@ void setup() {
   if (bootEpoch > 0) nextCycleEpoch = bootEpoch + (uint32_t)sleepIntervalSec;
   queueDepthCached = queuedRecordCount();
 
+  Serial.println(bmeOk ? "✅ BME280 present - pressure will be recorded."
+                       : "ℹ️ No BME280 fitted - pressure stays empty until one is plugged in.");
   Serial.println("\n--- Entering Main Loop ---\n");
 }
 
@@ -1014,18 +1065,27 @@ void readSensors(DataRecord &rec) {
   rec.windMPH      = windSpeed_MPH;
   rec.windMS       = windSpeed_MS;
   rec.windGustMS   = windGust_MS;
-  rec.rainTotal_mm = rain_mm;
+  rec.rainInterval_mm = rain_mm;
 
   // ---- DHT22 (Air Temperature & Humidity) ----
   float t = dht.readTemperature();
   float h = dht.readHumidity();
   if (isnan(t) || isnan(h)) {
     logError("DHT22 read failed (NaN).");
-    rec.temperature = -999.0;
-    rec.humidity    = -999.0;
+    rec.temperature = NAN;      // NAN travels all the way to a NULL column
+    rec.humidity    = NAN;
   } else {
     rec.temperature = t;
     rec.humidity    = h;
+  }
+
+  // ---- BME280 (station pressure) ----
+  // Absent for now, so this stays NAN and the column stays NULL.
+  if (bmeOk && bme.takeForcedMeasurement()) {
+    float pa = bme.readPressure();                 // library returns pascals
+    rec.pressure = isnan(pa) ? NAN : (pa / 100.0f);  // hPa
+  } else {
+    rec.pressure = NAN;
   }
 
   // ---- DS18B20 (Battery Temperature) ----
@@ -1036,11 +1096,11 @@ void readSensors(DataRecord &rec) {
       rec.batteryTemp = battTemp;
     } else {
       logError("DS18B20 read failed (disconnected).");
-      rec.batteryTemp = -999.0;
+      rec.batteryTemp = NAN;
       ds18b20Ok = false;
     }
   } else {
-    rec.batteryTemp = -999.0;
+    rec.batteryTemp = NAN;
   }
 
   // ---- ADS1115 ----
@@ -1060,8 +1120,8 @@ void readSensors(DataRecord &rec) {
   float sA = solarSensor.getCurrent_mA();
   if (isnan(sV) || isnan(sA)) {
     logError("INA219 Solar read failed.");
-    rec.solarVoltage = 0.0;
-    rec.solarCurrent_mA = 0.0;
+    rec.solarVoltage = NAN;     // 0.0 would read as a genuine measurement
+    rec.solarCurrent_mA = NAN;
   } else {
     rec.solarVoltage = sV;
     rec.solarCurrent_mA = sA;
@@ -1072,15 +1132,16 @@ void readSensors(DataRecord &rec) {
   float bA = batterySensor.getCurrent_mA();
   if (isnan(bV) || isnan(bA)) {
     logError("INA219 Battery read failed.");
-    rec.batteryVoltage = 0.0;
-    rec.batteryCurrent_mA = 0.0;
+    rec.batteryVoltage = NAN;
+    rec.batteryCurrent_mA = NAN;
   } else {
     rec.batteryVoltage = bV;
     rec.batteryCurrent_mA = bA;
   }
 
-  rec.sentMask = 0;
-  rec.retries  = 0;
+  rec.intervalSec = (uint32_t)(lastIntervalSec + 0.5f);
+  rec.sentMask    = 0;
+  rec.retries     = 0;
 }
 
 
@@ -1252,23 +1313,49 @@ bool setRtcFromString(const String &input) {
 
 // Queue lines carry two extra columns the archive does not need: the delivery
 // mask (which endpoints already accepted this record) and a retry count.
+// A missing reading is written as an empty field, not as a number. Writing
+// String(NAN, 2) would emit "nan", and reading it back with toFloat() yields
+// 0.0 - silently converting "no reading" into a real-looking zero on the first
+// queue round-trip.
+static String fmtField(float v, int dp) {
+  if (isnan(v)) return String();
+  return String(v, dp);
+}
+
+static float parseField(const String &f) {
+  if (f.length() == 0) return NAN;
+  // -999 was the old sentinel; treat it as missing so pre-existing queue lines
+  // do not come back as a temperature of minus nine hundred.
+  float v = f.toFloat();
+  if (v <= -998.0f && v >= -1000.0f) return NAN;
+  return v;
+}
+
+// Queue lines carry two extra columns the archive does not need: the delivery
+// mask (which endpoints already accepted this record) and a retry count.
 String recordToLine(const DataRecord &rec, bool includeQueueFields) {
-  String line = rec.timestamp + "," +
-                String(rec.windMPH, 2) + "," +
-                String(rec.windMS, 2) + "," +
-                String(rec.windGustMS, 2) + "," +
-                String(rec.rainTotal_mm, 2) + "," +
-                String(rec.temperature, 2) + "," +
-                String(rec.humidity, 1) + "," +
-                String(rec.batteryTemp, 2) + "," +
-                String(rec.solarVoltage, 3) + "," +
-                String(rec.solarCurrent_mA, 2) + "," +
-                String(rec.batteryVoltage, 3) + "," +
-                String(rec.batteryCurrent_mA, 2) + "," +
-                String(rec.adc0, 4) + "," +
-                String(rec.adc1, 4) + "," +
-                String(rec.adc2, 4) + "," +
-                String(rec.adc3, 4);
+  // Queue lines lead with a format tag so a stale one is rejected rather than
+  // parsed with today's column positions. The archive has a CSV header instead
+  // and is never read back, so it does not carry the tag.
+  String line = includeQueueFields ? String(QUEUE_FORMAT_TAG) + "," : String();
+  line += rec.timestamp + "," +
+                fmtField(rec.windMPH, 2) + "," +
+                fmtField(rec.windMS, 2) + "," +
+                fmtField(rec.windGustMS, 2) + "," +
+                fmtField(rec.rainInterval_mm, 2) + "," +
+                fmtField(rec.temperature, 2) + "," +
+                fmtField(rec.humidity, 1) + "," +
+                fmtField(rec.pressure, 2) + "," +
+                fmtField(rec.batteryTemp, 2) + "," +
+                fmtField(rec.solarVoltage, 3) + "," +
+                fmtField(rec.solarCurrent_mA, 2) + "," +
+                fmtField(rec.batteryVoltage, 3) + "," +
+                fmtField(rec.batteryCurrent_mA, 2) + "," +
+                fmtField(rec.adc0, 4) + "," +
+                fmtField(rec.adc1, 4) + "," +
+                fmtField(rec.adc2, 4) + "," +
+                fmtField(rec.adc3, 4) + "," +
+                String(rec.intervalSec);
   if (includeQueueFields) {
     line += "," + String(rec.sentMask) + "," + String(rec.retries);
   }
@@ -1276,15 +1363,13 @@ String recordToLine(const DataRecord &rec, bool includeQueueFields) {
 }
 
 bool parseLineToRecord(const String &line, DataRecord &rec) {
-  // Count separators before indexing anything. The previous version walked the
-  // line into a fixed array and could write one element past the end when a
-  // corrupt line carried extra commas.
+  // Count separators before indexing anything - walking a corrupt line into a
+  // fixed array is how this function used to write past the end.
   int commas = 0;
   for (unsigned int i = 0; i < line.length(); i++) {
     if (line.charAt(i) == ',') commas++;
   }
-  int count = commas + 1;
-  if (count < REC_FIELDS_BASE || count > REC_FIELDS_QUEUE) return false;
+  if (commas + 1 != REC_FIELDS_QUEUE) return false;
 
   String fields[REC_FIELDS_QUEUE];
   int start = 0, n = 0;
@@ -1295,24 +1380,29 @@ bool parseLineToRecord(const String &line, DataRecord &rec) {
   }
   fields[n++] = line.substring(start);
 
-  rec.timestamp         = fields[0];
-  rec.windMPH           = fields[1].toFloat();
-  rec.windMS            = fields[2].toFloat();
-  rec.windGustMS        = fields[3].toFloat();
-  rec.rainTotal_mm      = fields[4].toFloat();
-  rec.temperature       = fields[5].toFloat();
-  rec.humidity          = fields[6].toFloat();
-  rec.batteryTemp       = fields[7].toFloat();
-  rec.solarVoltage      = fields[8].toFloat();
-  rec.solarCurrent_mA   = fields[9].toFloat();
-  rec.batteryVoltage    = fields[10].toFloat();
-  rec.batteryCurrent_mA = fields[11].toFloat();
-  rec.adc0              = fields[12].toFloat();
-  rec.adc1              = fields[13].toFloat();
-  rec.adc2              = fields[14].toFloat();
-  rec.adc3              = fields[15].toFloat();
-  rec.sentMask          = (n > 16) ? (uint8_t)fields[16].toInt() : 0;
-  rec.retries           = (n > 17) ? (uint8_t)fields[17].toInt() : 0;
+  // Written by a different firmware layout - the columns would not line up.
+  if (fields[0] != QUEUE_FORMAT_TAG) return false;
+
+  rec.timestamp         = fields[1];
+  rec.windMPH           = parseField(fields[2]);
+  rec.windMS            = parseField(fields[3]);
+  rec.windGustMS        = parseField(fields[4]);
+  rec.rainInterval_mm   = parseField(fields[5]);
+  rec.temperature       = parseField(fields[6]);
+  rec.humidity          = parseField(fields[7]);
+  rec.pressure          = parseField(fields[8]);
+  rec.batteryTemp       = parseField(fields[9]);
+  rec.solarVoltage      = parseField(fields[10]);
+  rec.solarCurrent_mA   = parseField(fields[11]);
+  rec.batteryVoltage    = parseField(fields[12]);
+  rec.batteryCurrent_mA = parseField(fields[13]);
+  rec.adc0              = parseField(fields[14]);
+  rec.adc1              = parseField(fields[15]);
+  rec.adc2              = parseField(fields[16]);
+  rec.adc3              = parseField(fields[17]);
+  rec.intervalSec       = (uint32_t)fields[18].toInt();
+  rec.sentMask          = (uint8_t)fields[19].toInt();
+  rec.retries           = (uint8_t)fields[20].toInt();
   return true;
 }
 
@@ -1348,23 +1438,37 @@ static int httpPost(const String &url, const String &payload) {
   return code;
 }
 
+// Only add a key when the reading is real. An omitted key leaves the Django
+// column NULL, which is the honest representation of a failed sensor - a -999
+// or a 0.0 would be indistinguishable from a measurement.
+static void putIfReal(JsonDocument &doc, const char *key, float v) {
+  if (!isnan(v)) doc[key] = v;
+}
+
 static String buildWeatherJson(const DataRecord &rec) {
   JsonDocument doc;
   doc["station_code"] = stationCode;
   doc["timestamp"]    = rec.timestamp;
-  doc["temperature"]  = rec.temperature;
-  doc["humidity"]     = rec.humidity;
-  doc["rain"]         = rec.rainTotal_mm;
-  doc["wind_speed"]   = rec.windMS;
-  doc["wind_gust"]    = rec.windGustMS;
-#if SEND_PLACEHOLDER_FIELDS
-  // Not measured by this station - see SEND_PLACEHOLDER_FIELDS in config.h.
-  doc["pressure"]       = 1013.2;
-  doc["altitude"]       = 1150.0;
-  doc["light"]          = 0.0;
-  doc["soil_moisture"]  = 0.0;
-  doc["wind_direction"] = 0;
-#endif
+  doc["interval_s"]   = rec.intervalSec;
+
+  putIfReal(doc, "temperature", rec.temperature);   // degC, DHT22
+  putIfReal(doc, "humidity",    rec.humidity);      // %RH, DHT22
+  putIfReal(doc, "pressure",    rec.pressure);      // hPa, BME280 station pressure
+  putIfReal(doc, "rain",        rec.rainInterval_mm);  // mm this interval
+  putIfReal(doc, "wind_speed",  rec.windMS);        // m/s, interval mean
+
+  // Raw ADS1115 pin voltages, plus the values derived from them. Both are sent:
+  // the raw volts stay ground truth, so a wrong constant in calibration.h is
+  // repairable with one SQL UPDATE instead of being lost data.
+  putIfReal(doc, "wind_direction_v",  rec.adc0);
+  putIfReal(doc, "soil_moisture_v",   rec.adc1);
+  putIfReal(doc, "solar_radiation_v", rec.adc2);
+
+  int dir = vaneDirectionInt(rec.adc0);
+  if (dir >= 0) doc["wind_direction"] = dir;             // integer 0-359
+  putIfReal(doc, "soil_moisture",   soilMoisturePct(rec.adc1));
+  putIfReal(doc, "solar_radiation", irradianceWm2(rec.adc2));
+
   String out;
   serializeJson(doc, out);
   return out;
@@ -1374,14 +1478,11 @@ static String buildVoltageJson(const DataRecord &rec) {
   JsonDocument doc;
   doc["station_code"] = stationCode;
   doc["timestamp"]    = rec.timestamp;
-  doc["volt_batt"]    = rec.batteryVoltage;
-  doc["volt_solar"]   = rec.solarVoltage;
-  doc["volt_dc"]      = rec.batteryVoltage;
-  doc["battery_temp"] = rec.batteryTemp;
-#if SEND_PLACEHOLDER_FIELDS
-  doc["volt_3v3"] = 0.0;
-  doc["volt_5v"]  = 0.0;
-#endif
+
+  putIfReal(doc, "volt_batt",    rec.batteryVoltage);
+  putIfReal(doc, "volt_solar",   rec.solarVoltage);
+  putIfReal(doc, "battery_temp", rec.batteryTemp);   // degC, DS18B20
+
   String out;
   serializeJson(doc, out);
   return out;
@@ -1391,8 +1492,11 @@ static String buildCurrentJson(const DataRecord &rec) {
   JsonDocument doc;
   doc["station_code"] = stationCode;
   doc["timestamp"]    = rec.timestamp;
-  doc["curr_batt"]    = rec.batteryCurrent_mA / 1000.0;
-  doc["curr_solar"]   = rec.solarCurrent_mA / 1000.0;
+
+  // The API stores amps; the INA219 reports milliamps.
+  if (!isnan(rec.batteryCurrent_mA)) doc["curr_batt"]  = rec.batteryCurrent_mA / 1000.0;
+  if (!isnan(rec.solarCurrent_mA))   doc["curr_solar"] = rec.solarCurrent_mA / 1000.0;
+
   String out;
   serializeJson(doc, out);
   return out;
@@ -1415,6 +1519,10 @@ static SendOutcome sendRecord(DataRecord &rec) {
     if (i == 0)      payload = buildWeatherJson(rec);
     else if (i == 1) payload = buildVoltageJson(rec);
     else             payload = buildCurrentJson(rec);
+
+    // Print exactly what goes on the wire - this is the ground truth when a
+    // field is not landing in the database.
+    Serial.printf("📦 POST %s\n   %s\n", names[i], payload.c_str());
 
     int code = httpPost(urls[i], payload);
 

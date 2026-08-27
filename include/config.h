@@ -18,6 +18,7 @@
 #include <vector>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <Adafruit_BME280.h>
 #include <time.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -47,6 +48,12 @@
 
 // ========== Sensor Constants ==========
 #define DHTTYPE         DHT22
+
+// BME280 - not fitted yet. Detected on the bus at power-up, so plugging it in
+// starts producing pressure with no reflash. Sends STATION pressure; mean
+// sea-level pressure is derived server-side from the station altitude.
+#define BME280_ADDR_A   0x76
+#define BME280_ADDR_B   0x77
 #define MM_PER_TIP      0.2
 #define DEBOUNCE_US     100000      // 100 ms
 
@@ -95,23 +102,25 @@
 #define SD_REJECTED_FILE "/rejected.txt"
 #define SD_ERROR_FILE    "/error.log"
 
-#define SD_CSV_HEADER "Timestamp,WindMPH,WindMS,WindGust_MS,Rain_mm,Temp_C,Humidity%,BatteryTemp_C,Solar_V,Solar_mA,Batt_V,Batt_mA,ADC0,ADC1,ADC2,ADC3"
+#define SD_CSV_HEADER "Timestamp,WindMPH,WindMS,WindGust_MS,Rain_mm,Temp_C,Humidity%,Pressure_hPa,BatteryTemp_C,Solar_V,Solar_mA,Batt_V,Batt_mA,ADC0,ADC1,ADC2,ADC3,Interval_s"
 
-// Field counts for the CSV record format. Queue lines carry two extra columns
-// (delivery mask + retry count) that the archive does not need.
-#define REC_FIELDS_BASE   16
-#define REC_FIELDS_QUEUE  18
+// Field counts for the CSV record format. Queue lines carry a format tag in
+// front and two extra columns behind (delivery mask + retry count) that the
+// archive does not need.
+//
+// The tag exists because field counts alone are not enough: when the record
+// format gained columns, old queue lines still fell inside the accepted count
+// range and were parsed with the new indices, shifting every field. Bump the
+// tag whenever the layout changes and stale lines are rejected outright.
+#define QUEUE_FORMAT_TAG  "QV3"
+#define REC_FIELDS_BASE   18
+#define REC_FIELDS_QUEUE  21
 
 // Bits in DataRecord::sentMask - one per ingest endpoint.
 #define SENT_WEATHER  0x01
 #define SENT_VOLTAGE  0x02
 #define SENT_CURRENT  0x04
 #define SENT_ALL      0x07
-
-// The station has no barometer, light, soil or wind-vane sensor. Posting
-// invented numbers for them pollutes the dataset, so those keys are omitted.
-// Set to 1 if the ingest API rejects payloads that lack them.
-#define SEND_PLACEHOLDER_FIELDS 0
 
 // How many error lines to hold in RAM when the SD rail is powered down.
 #define ERROR_BUFFER_SLOTS 8
@@ -139,11 +148,13 @@ extern DHT                  dht;
 extern Preferences          preferences;
 extern OneWire              oneWire;
 extern DallasTemperature    ds18b20;
+extern Adafruit_BME280      bme;
 
 extern int sleepIntervalSec;
 extern String stationCode;
 extern bool relayOn;
 extern bool ds18b20Ok;
+extern bool bmeOk;          // BME280 answered on the I2C bus this power-up
 extern bool rtcOk;          // DS3231 responded on the I2C bus
 extern bool rtcTimeValid;   // ...and the time it holds is trustworthy
 extern bool haveLastRecord;     // a reading has been taken since boot
@@ -157,15 +168,17 @@ struct DataRecord {
   float windMPH;
   float windMS;
   float windGustMS;         // highest 3 s average within the interval
-  float rainTotal_mm;
+  float rainInterval_mm;     // mm in THIS interval only - not cumulative
   float temperature;        // Air temp (DHT22)
   float humidity;           // Air humidity (DHT22)
+  float pressure;           // Station pressure (BME280), hPa - NAN until fitted
   float batteryTemp;        // Battery temperature (DS18B20)
   float solarVoltage;
   float solarCurrent_mA;
   float batteryVoltage;
   float batteryCurrent_mA;
-  float adc0, adc1, adc2, adc3;
+  float adc0, adc1, adc2, adc3;   // raw ADS1115 volts: vane, soil, solar rad, unused
+  uint32_t intervalSec;           // seconds that rain / windMS average over
   uint8_t sentMask;         // which ingest endpoints already accepted this record
   uint8_t retries;
 };
