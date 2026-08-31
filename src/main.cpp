@@ -1,6 +1,7 @@
 #include "config.h"
 #include "portal_html.h"
 #include "calibration.h"
+#include "serial_ui.h"
 
 // ---------- Object Instances ----------
 Adafruit_ADS1115      ads;
@@ -193,11 +194,11 @@ void snapshotPulseCounters() {
   uint32_t missed = ambiguousWakes;
   ambiguousWakes = 0;
   if (missed > 0) {
-    Serial.printf("⚠️ %lu wake(s) not attributable to a pin - pulses may be undercounted.\n",
+    logWarn("%lu wake(s) not attributable to a pin - pulses may be undercounted.",
                   (unsigned long)missed);
   }
 
-  Serial.printf("🌬️ %lu pulses / %.0f s -> %.2f m/s avg, %.2f m/s gust   🌧️ %lu tips -> %.1f mm\n",
+  logStep("wind %lu pulses / %.0f s -> %.2f m/s avg, %.2f m/s gust | rain %lu tips -> %.1f mm",
                 (unsigned long)windPulses, elapsed, windSpeed_MS, windGust_MS,
                 (unsigned long)rainTips, rain_mm);
 }
@@ -221,7 +222,7 @@ static void reportStuckReed(const char *which) {
   static uint32_t lastReportMs = 0;
   if ((millis() - lastReportMs) < 60000UL) return;
   lastReportMs = millis();
-  Serial.printf("⚠️ %s reed still closed after %d ms - check for a stuck contact.\n",
+  logWarn("%s reed still closed after %d ms - check for a stuck contact.",
                 which, REED_RELEASE_MS);
 }
 
@@ -307,7 +308,7 @@ void loadConfig() {
                 ? preferences.getString("station")
                 : String("AWS-UG-001");
   preferences.end();
-  Serial.printf("⏱️ Loaded: Sleep %d s, Station %s\n", sleepIntervalSec, stationCode.c_str());
+  logOk("Config loaded: interval %d s, station %s", sleepIntervalSec, stationCode.c_str());
 }
 
 void saveConfig(int newInterval, const String &newStation) {
@@ -317,7 +318,7 @@ void saveConfig(int newInterval, const String &newStation) {
   preferences.end();
   if (newInterval > 0) sleepIntervalSec = newInterval;
   if (newStation.length() > 0) stationCode = newStation;
-  Serial.printf("💾 Saved: Interval %d s, Station %s\n", sleepIntervalSec, stationCode.c_str());
+  logOk("Config saved: interval %d s, station %s", sleepIntervalSec, stationCode.c_str());
 }
 
 // ---------- Error Logging ----------
@@ -347,12 +348,12 @@ void flushBufferedErrors() {
   }
   errorBufferCount   = 0;
   errorBufferDropped = 0;
-  Serial.printf("📝 Flushed %u buffered error(s) to the log.\n", flushed);
+  logInfo("Flushed %u buffered error(s) to the log.", flushed);
 }
 
 void logError(const String &message) {
   String line = getTimestamp() + " | " + message;
-  Serial.println("⚠️ " + line);
+  Serial.println(TAG_FAIL " " + line);
   if (!appendSD(line, SD_ERROR_FILE)) bufferError(line);
 }
 
@@ -369,7 +370,7 @@ bool appendSD(const String &line, const char *filename) {
 bool connectWiFi() {
   // Check if already connected
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("📶 WiFi already connected.");
+    logOk("WiFi already connected.");
     return true;
   }
 
@@ -385,11 +386,11 @@ bool connectWiFi() {
 
   // If Preferences has saved credentials, use them
   if (savedSSID.length() > 0 && savedPassword.length() > 0) {
-    Serial.printf("📶 Using saved WiFi: %s\n", savedSSID.c_str());
+    logStep("Using saved WiFi: %s", savedSSID.c_str());
     WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
   } else {
     // Fallback to hard-coded credentials (only if no saved credentials)
-    Serial.printf("📶 No saved credentials - using fallback: %s\n", WIFI_SSID_FALLBACK);
+    logStep("No saved credentials - using fallback: %s", WIFI_SSID_FALLBACK);
     WiFi.begin(WIFI_SSID_FALLBACK, WIFI_PASSWORD_FALLBACK);
   }
 
@@ -402,12 +403,14 @@ bool connectWiFi() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n✅ WiFi connected!");
-    Serial.print("📶 IP Address: ");
+    Serial.println();
+    logOk("WiFi connected.");
+    Serial.print(TAG_INFO " IP address: ");
     Serial.println(WiFi.localIP());
     return true;
   } else {
-    Serial.println("\n❌ WiFi connection failed.");
+    Serial.println();
+    logFail("WiFi connection failed.");
     return false;
   }
 }
@@ -508,7 +511,7 @@ void sensorRailUp() {
   }
 
   if (!mountSD()) {
-    Serial.println("❌ SD did not remount after power-up.");
+    logFail("SD did not remount after power-up.");
   }
   flushBufferedErrors();     // there is somewhere to write again
 
@@ -525,7 +528,7 @@ void sensorRailUp() {
 
   bool bmeWasOk = bmeOk;
   bmeOk = detectBME280();
-  if (bmeOk && !bmeWasOk) Serial.println("✅ BME280 detected - pressure now being recorded.");
+  if (bmeOk && !bmeWasOk) logOk("BME280 detected - pressure now being recorded.");
 }
 
 void sensorRailDown() {
@@ -712,7 +715,7 @@ static void bringUpAccessPoint() {
 
 // Hand control to WiFiManager for provisioning, then take it back.
 static void runWiFiManagerHandoff() {
-  Serial.println("🔧 Handing off to WiFiManager for WiFi setup...");
+  logStep("Handing off to WiFiManager for WiFi setup...");
   portalServer.stop();
   portalDns.stop();
   delay(200);
@@ -720,30 +723,30 @@ static void runWiFiManagerHandoff() {
   WiFiManager wm;
   wm.setConfigPortalTimeout(PORTAL_TIMEOUT);
   wm.setAPCallback([](WiFiManager *) {
-    Serial.println("📶 WiFiManager AP up: " PORTAL_AP_SSID);
+    logInfo("WiFiManager AP up: " PORTAL_AP_SSID);
   });
 
   // Same SSID as our own portal, so the phone reconnects to a familiar name.
   bool got = wm.startConfigPortal(PORTAL_AP_SSID, NULL);
-  Serial.println(got ? "✅ New WiFi credentials saved."
-                     : "ℹ️ WiFi setup closed without changes.");
+  Serial.println(got ? TAG_OK   " New WiFi credentials saved."
+                     : TAG_INFO " WiFi setup closed without changes.");
 
   bringUpAccessPoint();
   startPortalServer();
 }
 
 static void doPortalUpload() {
-  Serial.println("📤 Forced upload from portal...");
+  logStep("Forced upload from portal...");
   sensorRailUp();                // the SD card shares the gated rail
   processPendingQueue();
   portalQueueDepth = queueDepthCached;
   sensorRailDown();
-  Serial.printf("📤 Forced upload done, %d record(s) still queued.\n", portalQueueDepth);
+  logOk("Forced upload done, %d record(s) still queued.", portalQueueDepth);
 }
 
 // ---------- The portal itself ----------
 void runConfigPortal() {
-  Serial.printf("🌐 Config portal open for %d s - join \"%s\", then browse to http://192.168.4.1\n",
+  logInfo("Config portal open for %d s - join \"%s\", then browse to http://192.168.4.1",
                 PORTAL_TIMEOUT, PORTAL_AP_SSID);
 
   portalShouldClose    = false;
@@ -776,12 +779,12 @@ void runConfigPortal() {
       doPortalUpload();
     }
     if (portalRestartPending) {
-      Serial.println("🔁 Restarting on portal request.");
+      logInfo("Restarting on portal request.");
       delay(300);                // let the response flush first
       ESP.restart();
     }
     if (portalShouldClose) {
-      Serial.println("✅ Portal closed by user.");
+      logOk("Portal closed by user.");
       break;
     }
     delay(2);
@@ -792,48 +795,60 @@ void runConfigPortal() {
   WiFi.softAPdisconnect(true);
   WiFi.mode(previousMode);
 
-  Serial.printf("⚙️ Active settings: interval %d min, station %s, clock %s\n",
+  logInfo("Active settings: interval %d min, station %s, clock %s",
                 sleepIntervalSec / 60, stationCode.c_str(), getTimestamp().c_str());
-  Serial.println("✅ Configuration Portal finished.");
+  logOk("Configuration portal finished.");
 }
 
 // ================== Display Sensor Values ==================
 void printSensorValues(const DataRecord &rec) {
-  Serial.println("\n");
-  Serial.println("│               📊 SENSOR READINGS                    │");
-  
-  Serial.printf("│ 📅 Timestamp:   %-30s │\n", rec.timestamp.c_str());
-  Serial.printf("│ ⏱️  Interval:    %6lu s                            │\n", (unsigned long)rec.intervalSec);
+  char buf[UI_VALUE_W + 1];
 
-  Serial.printf("│ 🌬️  Wind avg:    %6.2f m/s  (%6.2f MPH)      │\n", rec.windMS, rec.windMPH);
-  Serial.printf("│ 💨  Wind gust:   %6.2f m/s                       │\n", rec.windGustMS);
-  Serial.printf("│ 🌧️  Rain:        %8.2f mm this interval          │\n", rec.rainInterval_mm);
-  
-  Serial.printf("│ 🌡️  Air Temp:     %6.2f °C                        │\n", rec.temperature);
-  Serial.printf("│ 💧  Humidity:     %6.1f %% RH                      │\n", rec.humidity);
-  Serial.printf("│ 🧭  Pressure:     %6.2f hPa  %-14s │\n", rec.pressure,
-                bmeOk ? "" : "(no BME280)");
-  Serial.printf("│ 🔥  Batt Temp:    %6.2f °C                        │\n", rec.batteryTemp);
-  
-  Serial.printf("│ ☀️  Solar:        %6.3f V  %7.2f mA              │\n", rec.solarVoltage, rec.solarCurrent_mA);
-  Serial.printf("│ 🔋  Battery:      %6.3f V  %7.2f mA              │\n", rec.batteryVoltage, rec.batteryCurrent_mA);
-  
-  Serial.printf("│ 📊 ADC0: %6.4f V   ADC1: %6.4f V           │\n", rec.adc0, rec.adc1);
-  Serial.printf("│ 📊 ADC2: %6.4f V   ADC3: %6.4f V           │\n", rec.adc2, rec.adc3);
+  Serial.println();
+  uiTitle("SENSOR READINGS");
+
+  uiRow("Timestamp", rec.timestamp.c_str());
+  uiRowInt("Interval", (long)rec.intervalSec, "s");
+
+  snprintf(buf, sizeof(buf), "%8.2f  m/s   (%.2f mph)", rec.windMS, rec.windMPH);
+  uiRow("Wind avg", buf);
+  uiRowNum("Wind gust", rec.windGustMS, 2, "m/s");
+  uiRowNum("Rain", rec.rainInterval_mm, 2, "mm", "this interval");
+
+  uiRowNum("Air temp", rec.temperature, 2, "C");
+  uiRowNum("Humidity", rec.humidity, 1, "%RH");
+  uiRowNum("Pressure", rec.pressure, 2, "hPa", bmeOk ? "" : "(no BME280)");
+  uiRowNum("Batt temp", rec.batteryTemp, 2, "C");
+
+  snprintf(buf, sizeof(buf), "%8.3f V %8.2f mA", rec.solarVoltage, rec.solarCurrent_mA);
+  uiRow("Solar", buf);
+  snprintf(buf, sizeof(buf), "%8.3f V %8.2f mA", rec.batteryVoltage, rec.batteryCurrent_mA);
+  uiRow("Battery", buf);
+
+  uiRule();
 
   int dirDeg = vaneDirectionInt(rec.adc0);
-  if (dirDeg >= 0) Serial.printf("│ 🧭  Wind dir:    %6d deg                         │\n", dirDeg);
-  else             Serial.println("│ 🧭  Wind dir:        -- (out of range)              │");
-  Serial.printf("│ 🌱  Soil:        %6.1f %%                            │\n", soilMoisturePct(rec.adc1));
-  Serial.printf("│ ☀️   Irradiance: %6.1f W/m2                        │\n", irradianceWm2(rec.adc2));
-  Serial.println("\n");
+  if (dirDeg >= 0) uiRowInt("Wind dir", (long)dirDeg, "deg");
+  else             uiRow("Wind dir", "      --  deg   (out of range)");
+  uiRowNum("Soil", soilMoisturePct(rec.adc1), 1, "%");
+  uiRowNum("Irradiance", irradianceWm2(rec.adc2), 1, "W/m2");
+
+  snprintf(buf, sizeof(buf), "%8.4f V %8.4f V", rec.adc0, rec.adc1);
+  uiRow("raw AIN0/1", buf);
+  snprintf(buf, sizeof(buf), "%8.4f V %8.4f V", rec.adc2, rec.adc3);
+  uiRow("raw AIN2/3", buf);
+
+  uiRule();
+  Serial.println();
 }
+
 
 // ---------- SETUP ----------
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n\n=== ESP32 Weather Station (WIMEA API) ===");
+  Serial.println();
+  Serial.println(C_BOLD "=== ESP32 Weather Station (WIMEA API) ===" C_RESET);
 
   loadConfig();
 
@@ -855,15 +870,15 @@ void setup() {
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   if (!mountSD()) {
     // Can't logError() this one - there is nowhere to write it.
-    Serial.println("❌ SD Card mount failed (CS=5).");
+    logFail("SD card mount failed (CS=5).");
   } else {
-    Serial.println("✅ SD Card mounted.");
+    logOk("SD card mounted.");
     if (!SD.exists(SD_DATA_FILE)) {
       File f = SD.open(SD_DATA_FILE, FILE_WRITE);
       if (f) {
         f.println(SD_CSV_HEADER);
         f.close();
-        Serial.println("CSV header created.");
+        logInfo("CSV header created.");
       }
     }
     if (!SD.exists(SD_ERROR_FILE)) {
@@ -880,15 +895,15 @@ void setup() {
   // Second, so the sensor errors below get stamped with a real time.
   if (rtc.begin()) {
     rtcOk = true;
-    Serial.println("RTC OK.");
+    logOk("RTC found.");
     if (rtc.lostPower()) {
       // Flat coin cell, or first power-up of a new board.
       rtcTimeValid = false;
-      Serial.println("⚠️ RTC lost power - time is not trustworthy until NTP sync.");
+      logWarn("RTC lost power - time is not trustworthy until NTP sync.");
     } else {
       refreshRtcValidity();
     }
-    Serial.printf("🕒 RTC reads %s EAT (%s)\n", getTimestamp().c_str(),
+    logInfo("RTC reads %s EAT (%s)", getTimestamp().c_str(),
                   rtcTimeValid ? "valid" : "NEEDS SYNC");
   } else {
     rtcOk = false;
@@ -897,16 +912,16 @@ void setup() {
   }
 
   // ---- Remaining I2C sensors ----
-  if (ads.begin(0x48)) { ads.setGain(GAIN_TWOTHIRDS); Serial.println("ADS1115 OK."); }
+  if (ads.begin(0x48)) { ads.setGain(GAIN_TWOTHIRDS); logOk("ADS1115 found."); }
   else logError("ADS1115 not found.");
 
-  if (batterySensor.begin()) Serial.println("INA219 Batt OK.");
+  if (batterySensor.begin()) logOk("INA219 battery found.");
   else logError("INA219 Battery not found.");
-  if (solarSensor.begin()) Serial.println("INA219 Solar OK.");
+  if (solarSensor.begin()) logOk("INA219 solar found.");
   else logError("INA219 Solar not found.");
 
   dht.begin();
-  Serial.println("DHT22 ready.");
+  logOk("DHT22 ready.");
 
   pinMode(WIND_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(WIND_PIN), windISR, FALLING);
@@ -915,7 +930,7 @@ void setup() {
   // Counting starts now, so this is the start of the first interval.
   lastSnapshotEpoch  = currentEpoch();
   lastSnapshotMillis = millis();
-  Serial.println("🌬️ Wind & 🌧️ Rain interrupts armed.");
+  logOk("Wind and rain interrupts armed.");
 
   // ---- BME280 (pressure) ----
   bmeOk = detectBME280();
@@ -924,10 +939,10 @@ void setup() {
   ds18b20.begin();
   if (ds18b20.getDeviceCount() > 0) {
     ds18b20Ok = true;
-    Serial.println("✅ DS18B20 found");
+    logOk("DS18B20 found.");
   } else {
     ds18b20Ok = false;
-    Serial.println("❌ DS18B20 not found");
+    logFail("DS18B20 not found.");
     logError("DS18B20 not found on pin " + String(DS18B20_PIN));
   }
 
@@ -942,7 +957,7 @@ void setup() {
 
   // ---- BOOT Button: Force Config Portal ----
   if (bootPressed) {
-    Serial.println("🛠️ BOOT button pressed - forcing config portal.");
+    logInfo("BOOT button pressed - forcing config portal.");
     runConfigPortal();
     // After portal, reconnect WiFi (might have new credentials)
     wifiConnected = connectWiFi();
@@ -965,9 +980,11 @@ void setup() {
   if (bootEpoch > 0) nextCycleEpoch = bootEpoch + (uint32_t)sleepIntervalSec;
   queueDepthCached = queuedRecordCount();
 
-  Serial.println(bmeOk ? "✅ BME280 present - pressure will be recorded."
-                       : "ℹ️ No BME280 fitted - pressure stays empty until one is plugged in.");
-  Serial.println("\n--- Entering Main Loop ---\n");
+  Serial.println(bmeOk ? TAG_OK   " BME280 present - pressure will be recorded."
+                       : TAG_INFO " No BME280 fitted - pressure stays empty until one is plugged in.");
+  Serial.println();
+  Serial.println(C_BOLD "--- Entering Main Loop ---" C_RESET);
+  Serial.println();
 }
 
 // ---------- LOOP (one duty cycle, then back to sleep) ----------
@@ -1003,11 +1020,11 @@ void loop() {
   } else {
     enqueueRecord(rec);
   }
-  Serial.println("✅ Record written to SD.");
+  logOk("Record written to SD.");
 
 #if SD_INDEPENDENT_POWER
   sensorRailDown();
-  Serial.println("🔌 Sensor rail OFF.");
+  logStep("Sensor rail OFF.");
 #endif
 
   // ============================================
@@ -1018,14 +1035,14 @@ void loop() {
   if (connectWiFi()) {
     maybeResyncRTC();         // opportunistic: first chance, then once a day
     if (!processPendingQueue()) {
-      Serial.println("⏳ Queue not fully drained - the rest waits for next cycle.");
+      logWarn("Queue not fully drained - the rest waits for next cycle.");
     }
   } else {
     logError("No WiFi this cycle - the queue is left untouched.");
   }
 
   sensorRailDown();
-  Serial.println("🔌 Sensor rail OFF.");
+  logStep("Sensor rail OFF.");
 
   // ============================================
   // PHASE 3: CONFIG PORTAL
@@ -1044,7 +1061,7 @@ void loop() {
   // shares the gated rail.
   long sleepLeft = (long)(nextCycleMillis - millis()) / 1000;
   if (sleepLeft < 0) sleepLeft = 0;
-  Serial.printf("💤 Sleeping %ld s until the next burst (wind/rain still counted)...\n",
+  logStep("Sleeping %ld s until the next burst (wind/rain still counted)...",
                 sleepLeft);
   Serial.flush();   // the UART has to drain before the clock stops
 
@@ -1052,7 +1069,8 @@ void loop() {
     sleepUntilNextEventOrDeadline();
   }
 
-  Serial.println("⏰ Sleep period finished.\n");
+  logStep("Sleep period finished.");
+  Serial.println();
 }
 
 // ================== SENSOR READING ==================
@@ -1068,13 +1086,25 @@ void readSensors(DataRecord &rec) {
   rec.rainInterval_mm = rain_mm;
 
   // ---- DHT22 (Air Temperature & Humidity) ----
-  float t = dht.readTemperature();
-  float h = dht.readHumidity();
+  // Retry rather than discard a whole interval's temperature on one bad
+  // checksum. The spacing also covers the sensor's power-up settling time,
+  // which the rail power-cycle makes relevant on every burst.
+  float t = NAN, h = NAN;
+  int attempt = 1;
+  for (; attempt <= DHT_READ_ATTEMPTS; attempt++) {
+    t = dht.readTemperature();
+    h = dht.readHumidity();
+    if (!isnan(t) && !isnan(h)) break;
+    if (attempt < DHT_READ_ATTEMPTS) delay(DHT_RETRY_DELAY_MS);
+  }
+
   if (isnan(t) || isnan(h)) {
-    logError("DHT22 read failed (NaN).");
+    logError("DHT22 read failed after " + String(DHT_READ_ATTEMPTS) +
+             " attempts - check VCC (3.3-6 V), the data pull-up and the pin.");
     rec.temperature = NAN;      // NAN travels all the way to a NULL column
     rec.humidity    = NAN;
   } else {
+    if (attempt > 1) logWarn("DHT22 needed %d attempts.", attempt);
     rec.temperature = t;
     rec.humidity    = h;
   }
@@ -1204,7 +1234,7 @@ bool syncTimeFromNTP() {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   lastNtpAttemptMs = millis();
-  Serial.println("🕒 Requesting time from NTP...");
+  logStep("Requesting time from NTP...");
   // The offset makes getLocalTime() hand back EAT directly, which is exactly
   // what we want to write into the DS3231.
   configTime(TZ_OFFSET_SEC, 0, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
@@ -1231,14 +1261,14 @@ bool syncTimeFromNTP() {
     rtcTimeValid   = true;
     clockRefEpoch  = ntpTime.unixtime();
     clockRefMillis = millis();
-    Serial.printf("✅ RTC set from NTP (was off by %+ld s)\n", drift);
+    logOk("RTC set from NTP (was off by %+ld s)", drift);
   } else {
-    Serial.println("⚠️ NTP time acquired, but there is no RTC to store it in.");
+    logWarn("NTP time acquired, but there is no RTC to store it in.");
   }
 
   ntpEverSynced = true;
   lastNtpSyncMs = millis();
-  Serial.printf("🕒 Time is now %s EAT\n", getTimestamp().c_str());
+  logInfo("Time is now %s EAT", getTimestamp().c_str());
   return true;
 }
 
@@ -1300,7 +1330,7 @@ bool setRtcFromString(const String &input) {
   clockRefMillis = millis();
 
   if (railWasDown) setSensorPower(false);
-  Serial.printf("🕒 RTC set manually to %s EAT\n", getTimestamp().c_str());
+  logOk("RTC set manually to %s EAT", getTimestamp().c_str());
   return true;
 }
 
@@ -1522,13 +1552,14 @@ static SendOutcome sendRecord(DataRecord &rec) {
 
     // Print exactly what goes on the wire - this is the ground truth when a
     // field is not landing in the database.
-    Serial.printf("📦 POST %s\n   %s\n", names[i], payload.c_str());
+    logSend("POST %s", names[i]);
+    Serial.printf(C_DIM "       %s" C_RESET "\n", payload.c_str());
 
     int code = httpPost(urls[i], payload);
 
     if (code >= 200 && code < 300) {
       rec.sentMask |= bits[i];
-      Serial.printf("✅ %s accepted (HTTP %d)\n", names[i], code);
+      logOk("%s accepted (HTTP %d)", names[i], code);
     } else if (code >= 400 && code < 500) {
       anyPermanent = true;
       logError(String(names[i]) + " POST refused (HTTP " + String(code) + ")");
@@ -1636,7 +1667,7 @@ bool processPendingQueue() {
   }
 
   queueDepthCached = kept;
-  Serial.printf("📤 Queue: %d sent, %d rejected, %d still waiting.\n",
+  logInfo("Queue: %d sent, %d rejected, %d still waiting.",
                 sent, refused, kept);
   return (kept == 0);
 }

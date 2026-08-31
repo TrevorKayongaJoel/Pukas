@@ -49,6 +49,12 @@
 // ========== Sensor Constants ==========
 #define DHTTYPE         DHT22
 
+// The AM2302 needs ~1 s after power-up before its first reading is valid, and
+// returns a bad checksum now and then even when healthy. It will not produce a
+// new sample faster than every 2 s, so retries have to be spaced accordingly.
+#define DHT_READ_ATTEMPTS   3
+#define DHT_RETRY_DELAY_MS  2200
+
 // BME280 - not fitted yet. Detected on the bus at power-up, so plugging it in
 // starts producing pressure with no reflash. Sends STATION pressure; mean
 // sea-level pressure is derived server-side from the station altitude.
