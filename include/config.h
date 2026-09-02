@@ -28,8 +28,8 @@
 // ========== WiFi Credentials (FALLBACK - used only if no saved credentials) ==========
 #define WIFI_SSID_FALLBACK     "AWS_MIFI"
 #define WIFI_PASSWORD_FALLBACK "A2208554"
-#define PORTAL_TIMEOUT         180     // seconds the config portal stays open
-#define PORTAL_AP_SSID         "AWS-Config"   // same SSID for our portal and WiFiManager
+#define PORTAL_TIMEOUT         200   // seconds the config portal stays open
+#define PORTAL_AP_SSID         "AWS-Conf"   // same SSID for our portal and WiFiManager
 
 // ========== Pin Definitions ==========
 #define RELAY_PIN       13
