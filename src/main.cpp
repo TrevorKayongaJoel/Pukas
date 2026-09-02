@@ -384,8 +384,10 @@ bool connectWiFi() {
   String savedPassword = preferences.isKey("pass") ? preferences.getString("pass") : String();
   preferences.end();
 
-  // If Preferences has saved credentials, use them
-  if (savedSSID.length() > 0 && savedPassword.length() > 0) {
+  // An SSID alone is enough: requiring a password too would send an open
+  // network - which a field MiFi may well be - down the fallback path instead.
+  // An empty passphrase is what the ESP32 wants for an open AP anyway.
+  if (savedSSID.length() > 0) {
     logStep("Using saved WiFi: %s", savedSSID.c_str());
     WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
   } else {
@@ -728,8 +730,28 @@ static void runWiFiManagerHandoff() {
 
   // Same SSID as our own portal, so the phone reconnects to a familiar name.
   bool got = wm.startConfigPortal(PORTAL_AP_SSID, NULL);
-  Serial.println(got ? TAG_OK   " New WiFi credentials saved."
-                     : TAG_INFO " WiFi setup closed without changes.");
+
+  // WiFiManager leaves the credentials in the esp_wifi NVS area. connectWiFi()
+  // does not read that area - it reads the "wifi" Preferences namespace - and
+  // its explicit WiFi.begin() overwrites the esp_wifi copy with the fallback on
+  // the very next burst. So without this copy a network changed here is
+  // reported as saved, then silently discarded one cycle later.
+  if (got) {
+    String newSsid = wm.getWiFiSSID(true);
+    String newPass = wm.getWiFiPass(true);
+    if (newSsid.length() > 0) {
+      preferences.begin("wifi", false);
+      preferences.putString("ssid", newSsid);
+      preferences.putString("pass", newPass);
+      preferences.end();
+      logOk("New WiFi credentials saved: %s", newSsid.c_str());
+    } else {
+      logWarn("WiFiManager connected but reported no SSID - nothing saved, "
+              "the station will fall back to " WIFI_SSID_FALLBACK ".");
+    }
+  } else {
+    logInfo("WiFi setup closed without changes.");
+  }
 
   bringUpAccessPoint();
   startPortalServer();

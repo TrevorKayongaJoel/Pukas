@@ -26,9 +26,9 @@
 #include <driver/gpio.h>
 
 // ========== WiFi Credentials (FALLBACK - used only if no saved credentials) ==========
-#define WIFI_SSID_FALLBACK     "IoT-ra"
-#define WIFI_PASSWORD_FALLBACK "P9$y#F5x!b&"
-#define PORTAL_TIMEOUT         120     // seconds the config portal stays open
+#define WIFI_SSID_FALLBACK     "AWS_MIFI"
+#define WIFI_PASSWORD_FALLBACK "A2208554"
+#define PORTAL_TIMEOUT         180     // seconds the config portal stays open
 #define PORTAL_AP_SSID         "AWS-Config"   // same SSID for our portal and WiFiManager
 
 // ========== Pin Definitions ==========
